@@ -25,7 +25,7 @@ st.set_page_config(page_title="Validador Pós-Migração | Agante", page_icon="�
 st.markdown("""
 <style>
 .block-container{padding-top:1.4rem;max-width:1400px}
-.vpm-head{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid #dce3df;margin-bottom:8px}
+.vpm-head{display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid #dce3df;margin-bottom:8px}
 .vpm-wm{font-weight:700;letter-spacing:.06em;font-size:13px;padding:6px 10px;border:1.5px solid currentColor;border-radius:4px;line-height:1}
 .vpm-ag{color:#12804a}.vpm-sr{color:#0c9399}
 .vpm-sep{width:1px;height:30px;background:#dce3df}
@@ -196,16 +196,16 @@ if ss.result is None and not ss.get("_example_done"):
     load_example()
 
 # --------------------------------------------------------------------------- cabeçalho e menu
-def logo(fname, cls, txt):
+def logo(fname, cls, txt, h=30):
     p = os.path.join(ASSETS, fname)
     if os.path.exists(p):
         import base64
         b64 = base64.b64encode(open(p, "rb").read()).decode()
-        return f'<img src="data:image/png;base64,{b64}" style="height:34px;width:auto" alt="{txt}">'
+        return f'<img src="data:image/png;base64,{b64}" style="height:{h}px;width:auto;display:block" alt="{txt}">'
     return f'<span class="vpm-wm {cls}">{txt}</span>'
 
 
-st.markdown(f"""<div class="vpm-head">{logo("logo_agante.png", "vpm-ag", "AGANTE")}{logo("logo_senior.png", "vpm-sr", "SENIOR")}
+st.markdown(f"""<div class="vpm-head">{logo("logo_agante.png", "vpm-ag", "Agante Tecnologia", 30)}{logo("logo_senior.png", "vpm-sr", "Senior Sistemas", 28)}
 <div class="vpm-sep"></div><div class="vpm-title"><h1>Validador Pós-Migração</h1><p>Agante Tecnologia | Senior HCM</p></div></div>""",
             unsafe_allow_html=True)
 
