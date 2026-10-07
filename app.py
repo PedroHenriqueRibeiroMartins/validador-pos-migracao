@@ -74,7 +74,7 @@ def default_stages():
 
 
 def default_meta(resp=""):
-    return {"cliente": "", "projeto": "Migração de Dados HCM", "modulo": "Administração de Pessoal", "layout": "",
+    return {"cliente": "", "projeto": "Migração de Dados HCM", "modulo": "Administração de Pessoal",
             "data": date.today().isoformat(), "responsavel": resp}
 
 
@@ -82,74 +82,27 @@ ss = st.session_state
 if "stages" not in ss:
     ss.stages = default_stages()
     ss.meta = default_meta()
-    ss.fields, ss.key, ss.rules = [], [], dict(E.DEFAULT_RULES)
-    ss.result, ss.xlsx, ss.is_example, ss.sig, ss.errors = None, None, False, None, []
+    ss.rules = dict(E.DEFAULT_RULES)
+    ss.lays, ss.assign, ss.edit_lid = {}, {}, None
+    ss.items, ss.results, ss.xlsx, ss.summary = [], [], None, ""
+    ss.is_example, ss.errors = False, []
     ss.page = "Início"
-    ss.map_ver = 0
 
 
-@st.cache_data(show_spinner=False, max_entries=64)
-def build_cached(sources: tuple):
-    return E.build_stage([(n, d) for n, d in sources])
+@st.cache_resource(show_spinner=False, max_entries=96)
+def stage_cached(sources: tuple):
+    return E.group_stage(E.read_tables(list(sources)))
 
 
-def built_stages():
-    out = []
-    for s in ss.stages:
-        b = build_cached(tuple((n, d) for n, d in s["files"])) if s["files"] else {"headers": [], "rows": [], "info": []}
-        out.append({**b, "nome": s["nome"], "tipo": s["tipo"], "arquivos": ", ".join(n for n, _ in s["files"])})
-    return out
-
-
-def sync_fields(bs):
-    sig = tuple(tuple(b["headers"]) for b in bs)
-    if sig != ss.sig:
-        ss.sig = sig
-        ss.fields = E.auto_map(bs, ss.fields)
-        ss.key = [k for k in ss.key if any(f["nome"] == k for f in ss.fields)]
-        if not ss.key:
-            ss.key = E.guess_key(ss.fields)
-        ss.map_ver += 1
-
-
-def load_example():
-    ss.stages = default_stages()
-    for st_, (name, m) in zip(ss.stages, E.make_example()):
-        st_["files"] = [(name, m)]
-    ss.meta = {"cliente": "Cliente Exemplo S.A.", "projeto": "Migração de Dados HCM", "modulo": "Administração de Pessoal",
-               "layout": "Colaboradores (exemplo)", "data": date.today().isoformat(), "responsavel": "Equipe de Inteligência"}
-    ss.fields, ss.key, ss.sig = [], [], None
-    bs = built_stages()
-    sync_fields(bs)
-    for f in ss.fields:
-        if f["nome"] == "UF":
-            f["tipo"] = "texto"
-    ss.is_example = True
-    execute(bs)
-
-
-def reset_validation():
-    resp = ss.meta.get("responsavel", "") if not ss.is_example else ""
-    ss.stages, ss.meta = default_stages(), default_meta(resp)
-    ss.fields, ss.key, ss.sig, ss.result, ss.xlsx, ss.is_example, ss.errors = [], [], None, None, None, False, []
-
-
-def execute(bs=None):
-    bs = bs or built_stages()
-    ss.errors = E.validate(bs, ss.fields, ss.key)
-    if ss.errors:
-        return False
-    with st.spinner("Comparando registros…"):
-        ss.result = E.run_comparison(bs, ss.fields, ss.key, ss.rules, ss.meta)
-        ss.xlsx = E.export_excel(ss.result, bs)
-    return True
-
-
-def file_name_for_export():
-    import re
-    m = ss.result["meta"]
-    slug = lambda s: re.sub(r"[^A-Za-z0-9]+", "_", E.strip_accents(str(s or ""))).strip("_")[:40]  # noqa: E731
-    return f"Validacao_PosMigracao_{slug(m.get('cliente')) or 'cliente'}_{slug(m.get('layout')) or 'layout'}_{(m.get('data') or '').replace('-', '')}.xlsx"
+def compute():
+    """Lê as etapas, agrupa os arquivos por layout e pareia as etapas."""
+    sgi = [stage_cached(tuple(s["files"])) if s["files"] else {"groups": [], "info": []} for s in ss.stages]
+    A = E.assign_layouts([x["groups"] for x in sgi], ss.assign)
+    for L in A["layouts"]:
+        custom = ss.lays.get(L["lid"], {}).get("nome")
+        if custom:
+            L["nome"] = custom
+    return sgi, A
 
 
 def load_configs() -> list:
@@ -166,32 +119,100 @@ def save_configs(cfgs: list):
         json.dump(cfgs, fh, ensure_ascii=False, indent=2)
 
 
-def apply_config(c: dict):
-    ss.meta["layout"] = c.get("nome", ss.meta["layout"])
-    if c.get("modulo"):
-        ss.meta["modulo"] = c["modulo"]
+def apply_config_to(d: dict, c: dict, st_: list):
     ss.rules = {**ss.rules, **c.get("rules", {})}
-    for i, e in enumerate(c.get("etapas", [])):
-        if i >= len(ss.stages):
-            ss.stages.append(new_stage(e["nome"], e["tipo"]))
-        elif not ss.stages[i]["files"]:
-            ss.stages[i]["nome"], ss.stages[i]["tipo"] = e["nome"], e["tipo"]
-    bs = built_stages()
-    sync_fields(bs)
     by = {f["nome"]: f for f in c.get("fields", [])}
-    for f in ss.fields:
+    for f in d["fields"]:
         o = by.get(f["nome"])
         if not o:
             continue
         for k in ("tipo", "comparar", "obrigatorio", "tolerancia", "zeros", "papel"):
             f[k] = o.get(k, f[k])
         f["cols"] = [f["nome"] if si == 0 else (o["cols"][si] if si < len(o["cols"]) and o["cols"][si] in b["headers"] else f["cols"][si])
-                     for si, b in enumerate(bs)]
-    ss.key = [k for k in c.get("key", []) if any(f["nome"] == k for f in ss.fields)] or ss.key
-    ss.map_ver += 1
+                     for si, b in enumerate(st_)]
+    d["key"] = [k for k in c.get("key", []) if any(f["nome"] == k for f in d["fields"])] or d["key"]
+    d["ver"] += 1
 
 
-if ss.result is None and not ss.get("_example_done"):
+def sync_layout(L: dict):
+    """Etapas do layout + DE/PARA e chave (refeitos quando as colunas mudam)."""
+    st_ = E.layout_stages(L, ss.stages)
+    d = ss.lays.setdefault(L["lid"], {"fields": [], "key": [], "sig": None, "ver": 0, "nome": None, "cfg_checked": False})
+    sig = tuple(tuple(b["headers"]) for b in st_)
+    if sig != d["sig"]:
+        d["sig"] = sig
+        d["fields"] = E.auto_map(st_, d["fields"])
+        names = [f["nome"] for f in d["fields"]]
+        d["key"] = [k for k in d["key"] if k in names] or E.guess_key(d["fields"], st_[0])
+        d["ver"] += 1
+        if not d["cfg_checked"]:
+            d["cfg_checked"] = True
+            cfg = next((c for c in load_configs() if E.canon(c.get("nome")) == E.canon(L["nome"])), None)
+            if cfg:
+                apply_config_to(d, cfg, st_)
+                d["cfg_aplicada"] = cfg["nome"]
+    return st_, d
+
+
+def execute():
+    sgi, A = compute()
+    errs, items = [], []
+    if not A["layouts"]:
+        errs.append("Carregue os arquivos do Layout Inicial (primeira etapa).")
+    for L in A["layouts"]:
+        st_, d = sync_layout(L)
+        e = E.validate(st_, d["fields"], d["key"])
+        if e:
+            errs += [f"{L['nome']}: {x}" for x in e]
+            continue
+        R = E.run_comparison(st_, d["fields"], d["key"], ss.rules, {**ss.meta, "layout": L["nome"]})
+        R["lid"] = L["lid"]
+        items.append((R, st_))
+    ss.errors = errs
+    if not items:
+        return False
+    with st.spinner("Gerando relatório…"):
+        ss.items = items
+        ss.results = [R for R, _ in items]
+        ss.summary = E.build_summary_multi(ss.results)
+        ss.xlsx = E.export_excel_multi(items)
+    return True
+
+
+def load_example():
+    ss.stages = default_stages()
+    ex = E.make_example_multi()
+    for st_, t in zip(ss.stages, ("origem", "senior", "ajuste")):
+        st_["files"] = list(ex[t])
+    ss.meta = {"cliente": "Cliente Exemplo S.A.", "projeto": "Migração de Dados HCM", "modulo": "Administração de Pessoal",
+               "data": date.today().isoformat(), "responsavel": "Equipe de Inteligência"}
+    ss.lays, ss.assign = {}, {}
+    _, A = compute()
+    for L in A["layouts"]:
+        _, d = sync_layout(L)
+        for f in d["fields"]:
+            if f["nome"] == "UF":
+                f["tipo"] = "texto"
+    ss.is_example = True
+    execute()
+
+
+def reset_validation():
+    resp = ss.meta.get("responsavel", "") if not ss.is_example else ""
+    ss.stages, ss.meta = default_stages(), default_meta(resp)
+    ss.lays, ss.assign, ss.edit_lid = {}, {}, None
+    ss.items, ss.results, ss.xlsx, ss.summary, ss.is_example, ss.errors = [], [], None, "", False, []
+
+
+def file_name_for_export():
+    import re
+    m = ss.results[0]["meta"]
+    slug = lambda s: re.sub(r"[^A-Za-z0-9]+", "_", E.strip_accents(str(s or ""))).strip("_")[:40]  # noqa: E731
+    lay = slug(m.get("layout")) if len(ss.results) == 1 else f"{len(ss.results)}_layouts"
+    return f"Validacao_PosMigracao_{slug(m.get('cliente')) or 'cliente'}_{lay}_{(m.get('data') or '').replace('-', '')}.xlsx"
+
+
+if not ss.results and not ss.get("_example_done"):
     ss._example_done = True
     load_example()
 
@@ -214,9 +235,11 @@ if "nav_target" in ss:
     ss.page = ss.pop("nav_target")
 with st.sidebar:
     st.radio("Menu", PAGES, key="page")
-    if ss.result is not None:
+    if ss.results:
         st.divider()
-        st.caption(f"{ss.result['meta'].get('cliente') or 'Sem cliente'} · {ss.result['meta'].get('layout') or 'Sem layout'}")
+        n = len(ss.results)
+        st.caption(f"{ss.results[0]['meta'].get('cliente') or 'Sem cliente'} · "
+                   + (ss.results[0]['meta'].get('layout') if n == 1 else f"{n} layouts"))
         st.download_button("Exportar Excel", ss.xlsx, file_name=file_name_for_export(), width="stretch",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
@@ -227,48 +250,65 @@ def go(page):
 
 if ss.is_example and ss.page in ("Início", "Comparativo", "Divergências", "Dashboard"):
     c1, c2 = st.columns([5, 1.4])
-    c1.info("**Dados de exemplo.** Os resultados abaixo vêm de arquivos fictícios gerados para demonstração.")
+    c1.info("**Dados de exemplo.** Dois layouts fictícios (Colaboradores e 1031 Dependentes) validados no mesmo lote.")
     if c2.button("Iniciar com meus arquivos", type="primary", width="stretch"):
         reset_validation()
         go("Nova Validação")
         st.rerun()
 
-BS = built_stages()
-sync_fields(BS)
+SGI, LAY = compute()
+LAYOUTS = LAY["layouts"]
+for _L in LAYOUTS:
+    sync_layout(_L)
+if LAYOUTS and ss.edit_lid not in {L["lid"] for L in LAYOUTS}:
+    ss.edit_lid = LAYOUTS[0]["lid"]
 
 
 # --------------------------------------------------------------------------- componentes
-def mapping_editor(bs, key_prefix):
-    if not ss.fields:
+def layout_picker(label: str, key: str):
+    """Seleciona o layout em edição (chave/DE-PARA)."""
+    if not LAYOUTS:
+        return None
+    lids = [L["lid"] for L in LAYOUTS]
+    names = {L["lid"]: L["nome"] for L in LAYOUTS}
+    if len(lids) > 1:
+        ss.edit_lid = st.selectbox(label, lids, index=lids.index(ss.edit_lid), format_func=lambda x: names[x], key=key)
+    return next(L for L in LAYOUTS if L["lid"] == ss.edit_lid)
+
+
+def mapping_editor(L, key_prefix):
+    st_, d = sync_layout(L)
+    if not d["fields"]:
         st.caption("Carregue o Layout Inicial para montar o DE/PARA.")
         return
     tipo_lbl = {v: k for k, v in E.TIPOS.items()}
     papel_lbl = {v: k for k, v in E.PAPEIS.items()}
     zeros_lbl = {"Ignorar": "remover", "Considerar": "manter"}
     rows = []
-    for f in ss.fields:
+    for f in d["fields"]:
         r = {"Campo": f["nome"]}
-        for si, b in enumerate(bs[1:], start=1):
+        for si, b in enumerate(st_[1:], start=1):
             r[f"{si + 1}. {b['nome']}"] = f["cols"][si] if si < len(f["cols"]) else ""
         r.update({"Tipo": E.TIPOS[f["tipo"]], "Comparar": bool(f["comparar"]), "Obrigatório": bool(f["obrigatorio"]),
                   "Tolerância": float(f["tolerancia"] or 0), "Zeros à esquerda": "Ignorar" if f["zeros"] == "remover" else "Considerar",
                   "Papel": E.PAPEIS[f.get("papel", "")]})
         rows.append(r)
     df = pd.DataFrame(rows)
-    cfg = {"Campo": st.column_config.TextColumn(disabled=True, help=f"Coluna em {bs[0]['nome']}")}
-    for si, b in enumerate(bs[1:], start=1):
+    cfg = {"Campo": st.column_config.TextColumn(disabled=True, help=f"Coluna em {st_[0]['nome']}")}
+    for si, b in enumerate(st_[1:], start=1):
         cfg[f"{si + 1}. {b['nome']}"] = st.column_config.SelectboxColumn(options=[""] + b["headers"], help="Coluna correspondente nesta etapa")
     cfg.update({"Tipo": st.column_config.SelectboxColumn(options=list(E.TIPOS.values()), required=True),
                 "Tolerância": st.column_config.NumberColumn(min_value=0.0, step=0.01, format="%.2f", help="Diferença aceita em Número/Valor"),
                 "Zeros à esquerda": st.column_config.SelectboxColumn(options=list(zeros_lbl), help="Para campos do tipo Código"),
                 "Papel": st.column_config.SelectboxColumn(options=list(E.PAPEIS.values()), help="Usado nos filtros e no detalhe do registro")})
-    unmapped = sum(1 for f in ss.fields for si, b in enumerate(bs[1:], start=1) if b["headers"] and not f["cols"][si])
+    unmapped = sum(1 for f in d["fields"] for si, b in enumerate(st_[1:], start=1) if b["headers"] and not f["cols"][si])
     if unmapped:
         st.warning(f"{unmapped} pareamento(s) sem coluna. Campos sem par em uma extração do Senior ficam como validação manual.")
+    tag = hashlib.md5("|".join(b["nome"] for b in st_).encode()).hexdigest()[:6]
     ed = st.data_editor(df, column_config=cfg, hide_index=True, width="stretch", num_rows="fixed",
-                        key=f"{key_prefix}_{ss.map_ver}_{hashlib.md5('|'.join(b['nome'] for b in bs).encode()).hexdigest()[:6]}")
-    for f, (_, r) in zip(ss.fields, ed.iterrows()):
-        for si, b in enumerate(bs[1:], start=1):
+                        key=f"{key_prefix}_{L['lid']}_{d['ver']}_{tag}")
+    for f, (_, r) in zip(d["fields"], ed.iterrows()):
+        for si, b in enumerate(st_[1:], start=1):
             v = r.get(f"{si + 1}. {b['nome']}") or ""
             f["cols"][si] = v if v in b["headers"] else ""
         f["tipo"] = tipo_lbl.get(r["Tipo"], f["tipo"])
@@ -276,6 +316,22 @@ def mapping_editor(bs, key_prefix):
         f["tolerancia"] = float(r["Tolerância"] or 0)
         f["zeros"] = zeros_lbl.get(r["Zeros à esquerda"], f["zeros"])
         f["papel"] = papel_lbl.get(r["Papel"], "")
+
+
+def key_editor(L):
+    st_, d = sync_layout(L)
+    if not d["fields"]:
+        st.caption("Carregue o Layout Inicial para escolher as colunas da chave.")
+        return
+    names = [f["nome"] for f in d["fields"]]
+    c1, c2 = st.columns([5, 1])
+    d["key"] = c1.multiselect(f"Colunas que identificam o mesmo registro · {L['nome']}", names,
+                              default=[k for k in d["key"] if k in names], key=f"key_{L['lid']}_{d['ver']}")
+    c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if c2.button("Sugerir chave", width="stretch", key=f"sk_{L['lid']}"):
+        d["key"] = E.guess_key(d["fields"], st_[0]); d["ver"] += 1; st.rerun()
+    if d.get("cfg_aplicada"):
+        st.caption(f"Configuração salva “{d['cfg_aplicada']}” aplicada automaticamente a este layout.")
 
 
 def rules_editor(prefix):
@@ -290,15 +346,16 @@ def rules_editor(prefix):
                                help="Valores como 10, 10.0 e 10,00 são equivalentes nos tipos Número, Valor e Código.")
 
 
-def save_current_config():
-    if not ss.fields:
+def save_config_for(L):
+    _, d = sync_layout(L)
+    if not d["fields"]:
         st.toast("Carregue o Layout Inicial antes de salvar a configuração.")
         return
-    c = {"nome": ss.meta["layout"] or "Layout sem nome", "modulo": ss.meta["modulo"], "key": list(ss.key), "rules": dict(ss.rules),
+    c = {"nome": L["nome"], "modulo": ss.meta["modulo"], "key": list(d["key"]), "rules": dict(ss.rules),
          "etapas": [{"nome": s["nome"], "tipo": s["tipo"]} for s in ss.stages],
-         "fields": [{k: f[k] for k in ("nome", "cols", "tipo", "comparar", "obrigatorio", "tolerancia", "zeros", "papel")} for f in ss.fields],
+         "fields": [{k: f[k] for k in ("nome", "cols", "tipo", "comparar", "obrigatorio", "tolerancia", "zeros", "papel")} for f in d["fields"]],
          "atualizado_em": pd.Timestamp.now().strftime("%d/%m/%Y %H:%M")}
-    cfgs = [x for x in load_configs() if x["nome"] != c["nome"]]
+    cfgs = [x for x in load_configs() if E.canon(x["nome"]) != E.canon(c["nome"])]
     save_configs([c] + cfgs)
     st.toast(f"Configuração “{c['nome']}” salva.")
 
@@ -328,8 +385,8 @@ def record_detail(R, rec_key: str):
         return
     nz, names = R["nz"], [s["nome"] for s in R["stages"]]
     st.markdown(f"#### {rec.get('nome') or rec['key']}")
-    ids = " · ".join(x for x in [rec.get("matricula") and "Matrícula " + rec["matricula"], rec.get("cpf") and "CPF " + rec["cpf"],
-                                  rec.get("empresa") and "Empresa " + rec["empresa"]] if x)
+    ids = " · ".join(x for x in [R["meta"].get("layout"), rec.get("matricula") and "Matrícula " + rec["matricula"],
+                                  rec.get("cpf") and "CPF " + rec["cpf"], rec.get("empresa") and "Empresa " + rec["empresa"]] if x)
     st.markdown(f"{pill(rec['status'])} &nbsp; <code>Chave {rec['key']}</code> &nbsp; <span style='color:#73817a'>{ids}</span>", unsafe_allow_html=True)
     for n in rec["notes"]:
         st.warning(n)
@@ -362,46 +419,70 @@ def need_result():
         st.rerun()
 
 
+def result_picker(key: str, allow_all=True) -> list:
+    """Escolhe um layout ou todos; devolve a lista de resultados."""
+    if len(ss.results) == 1:
+        return ss.results
+    opts = {"Todos os layouts": ss.results} if allow_all else {}
+    for R in ss.results:
+        opts[R["meta"].get("layout") or "sem nome"] = [R]
+    return opts[st.selectbox("Layout", list(opts), key=key)]
+
+
+def errors_banner():
+    if ss.errors and ss.results:
+        st.warning("**Layouts não processados:**\n\n" + "\n".join(f"- {e}" for e in ss.errors))
+
+
 # --------------------------------------------------------------------------- páginas
 def page_inicio():
     st.markdown('<div class="vpm-eyebrow">Início</div>', unsafe_allow_html=True)
     st.subheader("O que foi enviado, o que ficou no Senior e o que precisou ser ajustado")
-    st.caption("Compare o arquivo de origem com a extração do Senior e com os layouts ajustados, campo a campo, e veja a situação final de cada registro.")
+    st.caption("Compare os arquivos de origem com a extração do Senior e com os layouts ajustados, campo a campo. "
+               "Vários layouts podem ser validados no mesmo lote.")
     st.markdown(flow_html([s["nome"] for s in ss.stages]), unsafe_allow_html=True)
-    R = ss.result
-    if R:
-        k = R["k"]
+    errors_banner()
+    if ss.results:
+        k = E.overall(ss.results)
+        m = ss.results[0]["meta"]
         with st.container(border=True):
             a, b = st.columns([1, 1.3])
             with a:
                 st.markdown('<div class="vpm-eyebrow">Validação atual</div>', unsafe_allow_html=True)
-                st.markdown(f"**{R['meta'].get('cliente') or 'Cliente não informado'}**  \n{R['meta'].get('projeto', '')} · "
-                            f"{R['meta'].get('modulo', '')} · {R['meta'].get('layout') or 'Layout não informado'}")
-                st.markdown(f'<div class="vpm-ader">{E.fmt_pct(k["aderencia"])}</div><div style="color:#73817a">de aderência da migração · '
-                            f'{E.fmt_int(k["corretos"])} de {E.fmt_int(k["total"])} registros sem divergência</div>', unsafe_allow_html=True)
+                lays = ", ".join(R["meta"].get("layout") for R in ss.results)
+                st.markdown(f"**{m.get('cliente') or 'Cliente não informado'}**  \n{m.get('projeto', '')} · {m.get('modulo', '')}  \n"
+                            f"{len(ss.results)} layout(s): {lays}")
+                st.markdown(f'<div class="vpm-ader">{E.fmt_pct(k["aderencia"])}</div><div style="color:#73817a">de aderência '
+                            f'{"geral " if len(ss.results) > 1 else ""}da migração · {E.fmt_int(k["corretos"])} de {E.fmt_int(k["total"])} '
+                            f'registros sem divergência</div>', unsafe_allow_html=True)
                 b1, b2 = st.columns(2)
-                if b1.button("Abrir comparativo", type="primary", width="stretch"):
-                    go("Comparativo"); st.rerun()
-                if b2.button("Dashboard", width="stretch"):
+                if b1.button("Dashboard", type="primary", width="stretch"):
                     go("Dashboard"); st.rerun()
+                if b2.button("Abrir comparativo", width="stretch"):
+                    go("Comparativo"); st.rerun()
             with b:
                 st.markdown('<div class="vpm-eyebrow">Resumo da validação</div>', unsafe_allow_html=True)
-                st.write(R["summary"])
+                st.write(ss.summary)
+        if len(ss.results) > 1:
+            st.dataframe(pd.DataFrame(E.overview_rows(ss.results)), hide_index=True, width="stretch",
+                         column_config={"Aderência (%)": st.column_config.ProgressColumn(format="%.2f%%", min_value=0, max_value=100)})
         c = st.columns(4)
         c[0].metric("Com divergência", E.fmt_int(k["divergentes"]))
         c[1].metric("Corrigidos", E.fmt_int(k["corrigidos"]))
         c[2].metric("Não migrados", E.fmt_int(k["nao_migrados"]))
         c[3].metric("Validação manual", E.fmt_int(k["manual"]))
     with st.container(border=True):
-        st.markdown("**Três formas de carregar os arquivos** (escolha em cada etapa da Nova Validação)")
+        st.markdown("**Como carregar vários layouts de uma vez**")
         c = st.columns(3)
-        c[0].markdown("**Upload**  \nArraste um ou vários arquivos XLSX, XLS, CSV ou TXT para a etapa.")
-        c[1].markdown("**Leitura (colar)**  \nCopie o conteúdo do CSV ou as células do Excel, com o cabeçalho, e cole.")
-        c[2].markdown("**Caminho na máquina**  \nCole o caminho do arquivo ou da pasta (ex.: `C:\\Migracao\\Cliente`). "
-                      "Funciona quando o validador roda no seu computador ou tem acesso à pasta de rede.")
+        c[0].markdown("**1. Coloque todos os arquivos em cada etapa**  \nEx.: em *Layout Inicial*, os arquivos de Colaboradores, "
+                      "Dependentes, Férias… Em *Senior*, as extrações correspondentes.")
+        c[1].markdown("**2. O sistema separa por layout**  \nArquivos com as mesmas colunas são somados; estruturas diferentes viram "
+                      "layouts diferentes, pareados entre as etapas pelas colunas e pelo nome do arquivo.")
+        c[2].markdown("**3. Revise e compare**  \nConfira os layouts identificados, ajuste chave e DE/PARA de cada um e execute. "
+                      "O Excel sai com todos os layouts.")
 
 
-def stage_block(si: int, s: dict, b: dict):
+def stage_block(si: int, s: dict, info: dict, gname: dict):
     with st.container(border=True):
         c1, c2, c3 = st.columns([3, 2, 1])
         s["nome"] = c1.text_input("Nome da etapa", s["nome"], key=f"nm_{s['id']}", label_visibility="collapsed")
@@ -413,17 +494,21 @@ def stage_block(si: int, s: dict, b: dict):
                                      key=f"tp_{s['id']}", label_visibility="collapsed")
         if si >= 3 and c3.button("Excluir etapa", key=f"del_{s['id']}"):
             ss.stages.pop(si)
-            for f in ss.fields:
-                if si < len(f["cols"]):
-                    f["cols"].pop(si)
+            for d in ss.lays.values():
+                for f in d["fields"]:
+                    if si < len(f["cols"]):
+                        f["cols"].pop(si)
+                d["sig"] = None
             st.rerun()
-        st.caption(E.DESC_ETAPA[s["tipo"]] + (" Opcional; pode conter só os registros corrigidos." if s["tipo"] == "ajuste" else ""))
+        st.caption(E.DESC_ETAPA[s["tipo"]] + (" Opcional; pode conter só os registros corrigidos." if s["tipo"] == "ajuste" else "")
+                   + " Pode conter arquivos de vários layouts.")
         t_up, t_paste, t_path = st.tabs(["Upload", "Leitura (colar)", "Caminho na máquina"])
         with t_up:
             def on_upload(sid=s["id"]):
                 stg = next(x for x in ss.stages if x["id"] == sid)
                 ups = ss.get(f"up_{sid}_{stg['nonce']}") or []
-                stg["files"] += [(u.name, u.getvalue()) for u in ups]
+                have = {n for n, _ in stg["files"]}
+                stg["files"] += [(u.name, u.getvalue()) for u in ups if u.name not in have]
                 stg["nonce"] += 1
             st.file_uploader("Arraste um ou vários arquivos", type=["xlsx", "xlsm", "xls", "csv", "txt"], accept_multiple_files=True,
                              key=f"up_{s['id']}_{s['nonce']}", on_change=on_upload, label_visibility="collapsed")
@@ -456,19 +541,85 @@ def stage_block(si: int, s: dict, b: dict):
                 for e in errs:
                     st.error(e)
                 if read:
-                    s["files"] += read
+                    have = {n for n, _ in s["files"]}
+                    s["files"] += [x for x in read if x[0] not in have]
                     st.rerun()
             st.caption("Lê do computador onde o validador está rodando. No servidor Streamlit Cloud, use Upload ou Leitura.")
         if s["files"]:
-            info = pd.DataFrame(b["info"]).rename(columns={"fonte": "Fonte", "registros": "Registros", "usada": "Usada", "situacao": "Situação"})
-            st.dataframe(info, hide_index=True, width="stretch")
+            groups = info["groups"]
+            rows = [{"Fonte": i["fonte"], "Registros": i["registros"],
+                     "Layout": gname.get(groups[i["grupo"]]["gid"], "não associado") if i["grupo"] is not None else "—",
+                     "Situação": i["situacao"]} for i in info["info"]]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
             c1, c2 = st.columns([4, 1])
-            c1.markdown(f"**{E.fmt_int(len(b['rows']))}** registros · **{len(b['headers'])}** colunas")
+            c1.markdown(f"**{len(s['files'])}** arquivo(s) · **{len(groups)}** layout(s) nesta etapa · "
+                        f"**{E.fmt_int(sum(len(g['rows']) for g in groups))}** registros")
             if c2.button("Remover arquivos", key=f"clr_{s['id']}", width="stretch"):
                 s["files"] = []
                 s["nonce"] += 1
-                if si == 0:
-                    ss.fields, ss.key = [], []
+                st.rerun()
+
+
+def layouts_panel():
+    if not LAYOUTS:
+        st.caption("Os layouts aparecem aqui assim que os arquivos do Layout Inicial forem carregados.")
+        return
+    rows = []
+    for L in LAYOUTS:
+        r = {"lid": L["lid"], "Layout": L["nome"]}
+        for g, s in zip(L["groups"], ss.stages):
+            r[s["nome"]] = f"{E.fmt_int(len(g['rows']))} reg. · {', '.join(g['arquivos'])}" if g else "—"
+        sen_ok = any(g is not None and s["tipo"] == "senior" for g, s in zip(L["groups"], ss.stages))
+        r["Situação"] = "Pronto para comparar" if sen_ok else "Falta a extração do Senior"
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    cfg = {"lid": None, "Layout": st.column_config.TextColumn(help="Clique para renomear")}
+    for s in ss.stages:
+        cfg[s["nome"]] = st.column_config.TextColumn(disabled=True)
+    cfg["Situação"] = st.column_config.TextColumn(disabled=True)
+    ed = st.data_editor(df, column_config=cfg, hide_index=True, width="stretch", num_rows="fixed",
+                        key=f"lays_{hashlib.md5('|'.join(L['lid'] for L in LAYOUTS).encode()).hexdigest()[:8]}")
+    changed = False
+    for _, r in ed.iterrows():
+        L = next(x for x in LAYOUTS if x["lid"] == r["lid"])
+        novo = (r["Layout"] or "").strip()
+        if novo and novo != L["nome"]:
+            ss.lays[L["lid"]]["nome"] = novo
+            changed = True
+    if changed:
+        st.rerun()
+
+    others = [(si, g) for si in range(1, len(ss.stages)) for g in SGI[si]["groups"]]
+    if LAY["unassigned"]:
+        st.warning(f"{len(LAY['unassigned'])} arquivo(s)/grupo(s) sem layout correspondente: "
+                   + "; ".join(f"{ss.stages[si]['nome']}: {', '.join(g['arquivos'])}" for si, g in LAY["unassigned"])
+                   + ". Associe abaixo, se necessário.")
+    if others:
+        with st.expander("Ajustar pareamento dos arquivos com os layouts", expanded=bool(LAY["unassigned"])):
+            owner = {}
+            for L in LAYOUTS:
+                for g in L["groups"][1:]:
+                    if g:
+                        owner[g["gid"]] = L["nome"]
+            ign = "(ignorar)"
+            names = [L["nome"] for L in LAYOUTS]
+            pdf = pd.DataFrame([{"gid": g["gid"], "Etapa": ss.stages[si]["nome"], "Arquivo(s)": ", ".join(g["arquivos"]),
+                                 "Colunas": len(g["headers"]), "Registros": len(g["rows"]), "Layout": owner.get(g["gid"], ign)}
+                                for si, g in others])
+            ped = st.data_editor(pdf, hide_index=True, width="stretch", num_rows="fixed",
+                                 column_config={"gid": None, "Etapa": st.column_config.TextColumn(disabled=True),
+                                                "Arquivo(s)": st.column_config.TextColumn(disabled=True),
+                                                "Colunas": st.column_config.NumberColumn(disabled=True),
+                                                "Registros": st.column_config.NumberColumn(disabled=True),
+                                                "Layout": st.column_config.SelectboxColumn(options=names + [ign], required=True)},
+                                 key=f"pair_{hashlib.md5(json.dumps(sorted(ss.assign.items())).encode()).hexdigest()[:8]}_{len(others)}")
+            by_name = {L["nome"]: L["lid"] for L in LAYOUTS}
+            new = dict(ss.assign)
+            for _, r in ped.iterrows():
+                if r["Layout"] != owner.get(r["gid"], ign):
+                    new[r["gid"]] = "__ignorar" if r["Layout"] == ign else by_name.get(r["Layout"])
+            if new != ss.assign:
+                ss.assign = new
                 st.rerun()
 
 
@@ -483,61 +634,65 @@ def page_nova():
         st.error("**Revise antes de comparar:**\n\n" + "\n".join(f"- {e}" for e in ss.errors))
 
     st.markdown("##### 1 · Identificação")
-    cfgs = load_configs()
-    if cfgs:
-        sel = st.selectbox("Aplicar configuração salva", [""] + [c["nome"] for c in cfgs], format_func=lambda x: x or "Selecione um layout salvo…")
-        if sel and st.button("Aplicar configuração"):
-            apply_config(next(c for c in cfgs if c["nome"] == sel)); st.toast(f"Configuração “{sel}” aplicada."); st.rerun()
     m = ss.meta
     c = st.columns(3)
     m["cliente"] = c[0].text_input("Cliente", m["cliente"], placeholder="Razão social ou nome do cliente")
     m["projeto"] = c[1].text_input("Projeto", m["projeto"], placeholder="Ex.: Migração de Dados HCM")
     m["modulo"] = c[2].text_input("Módulo", m["modulo"], placeholder="Ex.: Administração de Pessoal, Benefícios, Ponto")
     c = st.columns(3)
-    m["layout"] = c[0].text_input("Layout", m["layout"], placeholder="Ex.: 1031 – Dependentes")
-    m["data"] = c[1].date_input("Data da validação", date.fromisoformat(m["data"]), format="DD/MM/YYYY").isoformat()
-    m["responsavel"] = c[2].text_input("Responsável pela validação", m["responsavel"], placeholder="Nome do analista")
+    m["data"] = c[0].date_input("Data da validação", date.fromisoformat(m["data"]), format="DD/MM/YYYY").isoformat()
+    m["responsavel"] = c[1].text_input("Responsável pela validação", m["responsavel"], placeholder="Nome do analista")
 
     st.markdown("##### 2 · Arquivos")
-    st.caption("XLSX, XLS, CSV ou TXT. Cabeçalho, separador e abas são identificados automaticamente; vários arquivos na mesma etapa são somados.")
-    for si, (s, b) in enumerate(zip(ss.stages, BS)):
-        stage_block(si, s, b)
+    st.caption("Carregue em cada etapa os arquivos de todos os layouts do lote (XLSX, XLS, CSV ou TXT). Cabeçalho, separador e abas "
+               "são identificados automaticamente; arquivos com as mesmas colunas são somados.")
+    gname = {}
+    for L in LAYOUTS:
+        for g in L["groups"]:
+            if g:
+                gname[g["gid"]] = L["nome"]
+    for si, (s, info) in enumerate(zip(ss.stages, SGI)):
+        stage_block(si, s, info, gname)
     c = st.columns([1, 1, 1, 3])
     for col, (nm, tp) in zip(c, [("Senior 2ª Carga", "senior"), ("Ajuste Final", "ajuste"), ("Nova etapa", "senior")]):
         if col.button(f"+ {nm}", width="stretch"):
             ss.stages.append(new_stage(nm, tp))
-            for f in ss.fields:
-                f["cols"].append("")
             st.rerun()
     st.markdown(flow_html([s["nome"] for s in ss.stages]), unsafe_allow_html=True)
 
-    st.markdown("##### 3 · Chave de comparação")
-    if ss.fields:
-        names = [f["nome"] for f in ss.fields]
-        c1, c2 = st.columns([5, 1])
-        ss.key = c1.multiselect("Colunas que identificam o mesmo registro em todos os arquivos", names,
-                                default=[k for k in ss.key if k in names], key=f"key_{ss.map_ver}")
-        if c2.button("Sugerir chave", width="stretch"):
-            ss.key = E.guess_key(ss.fields); ss.map_ver += 1; st.rerun()
-        st.caption("Exemplos: CPF · Matrícula · Empresa + Tipo de Colaborador + Cadastro (NumEmp + TipCol + NumCad) · Código do dependente.")
+    st.markdown(f"##### 3 · Layouts identificados ({len(LAYOUTS)})")
+    st.caption("Cada estrutura de colunas do Layout Inicial vira um layout. Os arquivos das outras etapas são pareados pelas colunas "
+               "e pelo nome. Renomeie os layouts na tabela, se quiser.")
+    layouts_panel()
+
+    st.markdown("##### 4 · Chave e DE/PARA por layout")
+    L = layout_picker("Layout em edição", "pick_nova")
+    if L:
+        key_editor(L)
+        st.caption("Exemplos: CPF · Matrícula · NumEmp + TipCol + NumCad · NumEmp + TipCol + NumCad + CodDep (dependentes).")
+        mapping_editor(L, "map_nova")
+        c1, c2, _ = st.columns([1.4, 1.6, 3])
+        if c1.button("Salvar configuração do layout", width="stretch"):
+            save_config_for(L)
+        cfgs = load_configs()
+        if cfgs:
+            with c2.popover("Aplicar configuração salva", width="stretch"):
+                sel = st.selectbox("Configuração", [x["nome"] for x in cfgs], key="cfg_sel_nova")
+                if st.button("Aplicar neste layout", key="cfg_ap_nova"):
+                    st_, d = sync_layout(L)
+                    apply_config_to(d, next(x for x in cfgs if x["nome"] == sel), st_)
+                    st.rerun()
     else:
-        st.caption("Carregue o Layout Inicial para escolher as colunas da chave.")
+        st.caption("Carregue o Layout Inicial para definir chave e DE/PARA.")
 
-    st.markdown("##### 4 · DE/PARA de campos")
-    st.caption("Colunas pareadas automaticamente por nome e por sinônimos Senior (ex.: MATRICULA → NumCad). Revise o que ficar sem par.")
-    mapping_editor(BS, "map_nova")
-    if st.button("Salvar configuração do layout"):
-        save_current_config()
-
-    st.markdown("##### 5 · Regras de normalização")
+    st.markdown("##### 5 · Regras de normalização (todos os layouts)")
     rules_editor("nova")
     st.divider()
-    if st.button("Executar comparação", type="primary"):
+    if st.button(f"Executar comparação{f' dos {len(LAYOUTS)} layouts' if len(LAYOUTS) > 1 else ''}", type="primary"):
         ss.is_example = False
         if execute():
-            go("Dashboard"); st.rerun()
-        else:
-            st.rerun()
+            go("Dashboard")
+        st.rerun()
 
 
 def lines_filtered(R, flt):
@@ -568,44 +723,67 @@ def lines_filtered(R, flt):
     return out
 
 
+def frames_for(sel, flt):
+    multi = len(sel) > 1
+    frames, recs = [], []
+    for R in sel:
+        lines = lines_filtered(R, flt)
+        frames.append(E.lines_frame(R, lines, with_layout=multi))
+        recs += [f"{ss.results.index(R)}|{k}" for k in dict.fromkeys(l["rec"]["key"] for l in lines)]
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return df, recs
+
+
+def record_expander(recs, key):
+    opts = {}
+    for t in recs:
+        i, k = t.split("|", 1)
+        R = ss.results[int(i)]
+        nome = next((r.get("nome") for r in R["records"] if r["key"] == k), "")
+        lbl = " · ".join(x for x in ([R["meta"].get("layout")] if len(ss.results) > 1 else []) + [k, nome] if x)
+        opts[lbl] = (R, k)
+    with st.expander("Ver registro completo", expanded=False):
+        sel = st.selectbox("Registro", list(opts), key=key) if opts else None
+        if sel:
+            record_detail(*opts[sel])
+
+
 def page_comparativo():
-    R = ss.result
-    if not R:
+    if not ss.results:
         return need_result()
     st.markdown('<div class="vpm-eyebrow">Comparativo</div>', unsafe_allow_html=True)
     st.subheader("Comparação campo a campo")
     st.caption("Cada linha mostra o valor do campo em todas as etapas e a situação final.")
-    st.markdown(flow_html([s["nome"] for s in R["stages"]]), unsafe_allow_html=True)
+    st.markdown(flow_html([s["nome"] for s in ss.results[0]["stages"]]), unsafe_allow_html=True)
+    sel = result_picker("lay_comp")
+    campos = list(dict.fromkeys(f["nome"] for R in sel for f in R["cmp_f"]))
     c = st.columns([2.2, 1.4, 1.6, 1])
     flt = {"q": c[0].text_input("Buscar", placeholder="Chave, nome, matrícula ou CPF"),
-           "campo": c[1].selectbox("Campo", ["", "(registro)"] + [f["nome"] for f in R["cmp_f"]], format_func=lambda x: x or "Todos"),
+           "campo": c[1].selectbox("Campo", ["", "(registro)"] + campos, format_func=lambda x: x or "Todos"),
            "status": c[2].selectbox("Resultado", [""] + [v["label"] for v in E.STATUS.values()], format_func=lambda x: x or "Todos")}
     c[3].markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     flt["only_div"] = c[3].checkbox("Somente diferenças")
-    lines = lines_filtered(R, flt)
-    paged_table(E.lines_frame(R, lines), "pg_comp")
-    keys = list(dict.fromkeys(l["rec"]["key"] for l in lines))
-    with st.expander("Ver registro completo", expanded=False):
-        sel = st.selectbox("Registro", keys, format_func=lambda k: next((f"{k} · {r.get('nome')}" for r in R["records"] if r["key"] == k), k),
-                           key="rec_comp") if keys else None
-        if sel:
-            record_detail(R, sel)
+    df, recs = frames_for(sel, flt)
+    paged_table(df, "pg_comp")
+    record_expander(recs, "rec_comp")
 
 
 def page_divergencias():
-    R = ss.result
-    if not R:
+    if not ss.results:
         return need_result()
     st.markdown('<div class="vpm-eyebrow">Divergências</div>', unsafe_allow_html=True)
     st.subheader("Análise de Divergências")
-    st.caption(f"Cliente: **{R['meta'].get('cliente') or '—'}** · Layout: **{R['meta'].get('layout') or '—'}** · "
-               f"processado em {R['at'].strftime('%d/%m/%Y %H:%M')}")
-    div = [l for l in R["lines"] if l["code"] != "OK"]
+    m = ss.results[0]["meta"]
+    st.caption(f"Cliente: **{m.get('cliente') or '—'}** · {len(ss.results)} layout(s) · "
+               f"processado em {ss.results[0]['at'].strftime('%d/%m/%Y %H:%M')}")
+    sel = result_picker("lay_div")
+    div = [l for R in sel for l in R["lines"] if l["code"] != "OK"]
     codes = [v["label"] for k, v in E.STATUS.items() if k != "OK" and any(l["code"] == k for l in div)]
     etapas = sorted({l["etapa"] for l in div if l["etapa"]})
+    campos = list(dict.fromkeys(f["nome"] for R in sel for f in R["cmp_f"]))
     c = st.columns(3)
     flt = {"only_div": True,
-           "campo": c[0].selectbox("Campo", ["", "(registro)"] + [f["nome"] for f in R["cmp_f"]], format_func=lambda x: x or "Todos", key="d_campo"),
+           "campo": c[0].selectbox("Campo", ["", "(registro)"] + campos, format_func=lambda x: x or "Todos", key="d_campo"),
            "status": c[1].selectbox("Tipo de divergência", [""] + codes, format_func=lambda x: x or "Todos", key="d_status"),
            "etapa": c[2].selectbox("Etapa da migração", [""] + etapas, format_func=lambda x: x or "Todas", key="d_etapa")}
     c = st.columns(4)
@@ -613,29 +791,18 @@ def page_divergencias():
     flt["matricula"] = c[1].text_input("Matrícula", key="d_mat")
     flt["cpf"] = c[2].text_input("CPF", key="d_cpf")
     flt["empresa"] = c[3].text_input("Empresa", key="d_emp")
-    lines = lines_filtered(R, flt)
-    df = E.lines_frame(R, lines).drop(columns=["Chave"])
+    df, recs = frames_for(sel, flt)
+    if "Chave" in df.columns:
+        df = df.drop(columns=["Chave"])
     paged_table(df, "pg_div")
-    keys = list(dict.fromkeys(l["rec"]["key"] for l in lines))
-    with st.expander("Ver registro completo", expanded=False):
-        sel = st.selectbox("Registro", keys, format_func=lambda k: next((f"{k} · {r.get('nome')}" for r in R["records"] if r["key"] == k), k),
-                           key="rec_div") if keys else None
-        if sel:
-            record_detail(R, sel)
+    record_expander(recs, "rec_div")
 
 
-def page_dashboard():
-    R = ss.result
-    if not R:
-        return need_result()
+def dashboard_detail(R):
     k = R["k"]
-    st.markdown('<div class="vpm-eyebrow">Dashboard</div>', unsafe_allow_html=True)
-    st.subheader("Painel da validação")
-    st.caption(f"{R['meta'].get('cliente') or 'Cliente não informado'} · {R['meta'].get('layout') or 'Layout não informado'} · "
-               f"processado em {R['at'].strftime('%d/%m/%Y %H:%M')}")
     with st.container(border=True):
         a, b = st.columns([1, 1.4])
-        a.markdown('<div class="vpm-eyebrow">Aderência da migração</div>'
+        a.markdown('<div class="vpm-eyebrow">Aderência da migração · ' + (R["meta"].get("layout") or "") + '</div>'
                    f'<div class="vpm-ader">{E.fmt_pct(k["aderencia"])}</div>'
                    f'<div class="vpm-meter"><span style="width:{k["aderencia"]}%;background:#1b7a43"></span></div>'
                    f'<div style="color:#73817a;font-size:12px">Registros sem divergência ÷ total analisado × 100 = '
@@ -675,16 +842,57 @@ def page_dashboard():
         st.dataframe(pd.DataFrame(aud, columns=["Item", "Valor"]).fillna("—"), hide_index=True, width="stretch")
 
 
+def page_dashboard():
+    if not ss.results:
+        return need_result()
+    st.markdown('<div class="vpm-eyebrow">Dashboard</div>', unsafe_allow_html=True)
+    st.subheader("Painel da validação")
+    m = ss.results[0]["meta"]
+    st.caption(f"{m.get('cliente') or 'Cliente não informado'} · {len(ss.results)} layout(s) · "
+               f"processado em {ss.results[0]['at'].strftime('%d/%m/%Y %H:%M')}")
+    errors_banner()
+    if len(ss.results) == 1:
+        return dashboard_detail(ss.results[0])
+    k = E.overall(ss.results)
+    with st.container(border=True):
+        a, b = st.columns([1, 1.4])
+        a.markdown('<div class="vpm-eyebrow">Aderência geral do lote</div>'
+                   f'<div class="vpm-ader">{E.fmt_pct(k["aderencia"])}</div>'
+                   f'<div class="vpm-meter"><span style="width:{k["aderencia"]}%;background:#1b7a43"></span></div>'
+                   f'<div style="color:#73817a;font-size:12px">{E.fmt_int(k["corretos"])} de {E.fmt_int(k["total"])} registros sem divergência, '
+                   f'em {k["layouts"]} layouts</div>', unsafe_allow_html=True)
+        b.markdown('<div class="vpm-eyebrow">Resumo geral</div>', unsafe_allow_html=True)
+        b.write(ss.summary)
+    cols = st.columns(5)
+    for col, (lbl, v) in zip(cols, [("Layouts", k["layouts"]), ("Registros", k["total"]), ("Com divergência", k["divergentes"]),
+                                    ("Não migrados", k["nao_migrados"]), ("Validação manual", k["manual"])]):
+        col.metric(lbl, E.fmt_int(v))
+    st.markdown("**Aderência por layout**")
+    st.dataframe(pd.DataFrame(E.overview_rows(ss.results)).sort_values("Aderência (%)"), hide_index=True, width="stretch",
+                 column_config={"Aderência (%)": st.column_config.ProgressColumn(format="%.2f%%", min_value=0, max_value=100)})
+    st.divider()
+    by = {R["meta"].get("layout") or f"Layout {j + 1}": R for j, R in enumerate(ss.results)}
+    dashboard_detail(by[st.selectbox("Detalhar layout", list(by), key="dash_lay")])
+
+
 def page_layouts():
     st.markdown('<div class="vpm-eyebrow">Configuração de Layouts</div>', unsafe_allow_html=True)
     st.subheader("Parametrização reutilizável por layout")
-    st.caption("Salve chave, DE/PARA, tipos, obrigatoriedade, tolerâncias e regras de um layout e reaplique em novas validações, para qualquer cliente.")
-    if ss.fields:
+    st.caption("Salve chave, DE/PARA, tipos, obrigatoriedade, tolerâncias e regras de cada layout. Na próxima validação, "
+               "a configuração é aplicada automaticamente ao layout de mesmo nome.")
+    if LAYOUTS:
         with st.container(border=True):
-            st.markdown(f"**Configuração atual:** {ss.meta['layout'] or 'Layout sem nome'} · chave `{' + '.join(ss.key) or '—'}` · "
-                        f"{len(ss.fields)} campos, {sum(1 for f in ss.fields if f['comparar'])} comparados")
-            if st.button("Salvar como configuração do layout", type="primary"):
-                save_current_config(); st.rerun()
+            L = layout_picker("Layout", "pick_cfg")
+            _, d = sync_layout(L)
+            st.markdown(f"**{L['nome']}** · chave `{' + '.join(d['key']) or '—'}` · {len(d['fields'])} campos, "
+                        f"{sum(1 for f in d['fields'] if f['comparar'])} comparados")
+            c1, c2, _ = st.columns([1.5, 1.8, 3])
+            if c1.button("Salvar este layout", type="primary", width="stretch"):
+                save_config_for(L); st.rerun()
+            if len(LAYOUTS) > 1 and c2.button(f"Salvar os {len(LAYOUTS)} layouts", width="stretch"):
+                for x in LAYOUTS:
+                    save_config_for(x)
+                st.rerun()
     cfgs = load_configs()
     st.markdown(f"**Layouts salvos** ({len(cfgs)}) · arquivo `configs/layouts.json`")
     if not cfgs:
@@ -693,11 +901,13 @@ def page_layouts():
     for i, c in enumerate(cfgs):
         with cols[i % 3].container(border=True):
             st.markdown(f"**{c['nome']}**  \n{c.get('modulo') or 'Módulo não informado'}")
-            st.caption(f"Chave: {' + '.join(c.get('key', []))} · {len(c.get('fields', []))} campos · "
-                       f"etapas: {' → '.join(e['nome'] for e in c.get('etapas', []))} · atualizado em {c.get('atualizado_em', '—')}")
+            st.caption(f"Chave: {' + '.join(c.get('key', []))} · {len(c.get('fields', []))} campos · atualizado em {c.get('atualizado_em', '—')}")
             b1, b2 = st.columns(2)
-            if b1.button("Aplicar", key=f"ap_{i}", type="primary", width="stretch"):
-                apply_config(c); go("Nova Validação"); st.rerun()
+            if LAYOUTS and b1.button("Aplicar no layout em edição", key=f"ap_{i}", type="primary", width="stretch"):
+                L = next(x for x in LAYOUTS if x["lid"] == ss.edit_lid)
+                st_, d = sync_layout(L)
+                apply_config_to(d, c, st_)
+                go("Nova Validação"); st.rerun()
             confirm = b2.checkbox("Confirmar exclusão", key=f"cf_{i}")
             if confirm and b2.button("Excluir", key=f"dl_{i}", width="stretch"):
                 save_configs([x for x in cfgs if x["nome"] != c["nome"]]); st.rerun()
@@ -719,22 +929,23 @@ def page_layouts():
 def page_depara():
     st.markdown('<div class="vpm-eyebrow">DE/PARA de Campos</div>', unsafe_allow_html=True)
     st.subheader("Mapeamento entre arquivos")
-    st.caption("Relacione cada coluna do Layout Inicial com a coluna correspondente em cada etapa. "
+    st.caption("Relacione cada coluna do Layout Inicial com a coluna correspondente em cada etapa, layout a layout. "
                "O pareamento automático reconhece nomes iguais e sinônimos usuais do Senior HCM.")
-    if ss.fields:
-        st.markdown(flow_html([s["nome"] for s in ss.stages], False), unsafe_allow_html=True)
-    mapping_editor(BS, "map_dp")
-    st.markdown("**Regras de normalização**")
+    L = layout_picker("Layout", "pick_dp")
+    if not L:
+        st.caption("Carregue o Layout Inicial em Nova Validação.")
+        return
+    st.markdown(flow_html([s["nome"] for s in ss.stages], False), unsafe_allow_html=True)
+    key_editor(L)
+    mapping_editor(L, "map_dp")
+    st.markdown("**Regras de normalização** (todos os layouts)")
     rules_editor("dp")
-    c1, c2, _ = st.columns([1.3, 1.3, 4])
+    c1, c2, _ = st.columns([1.3, 1.5, 4])
     if c1.button("Salvar configuração do layout"):
-        save_current_config()
+        save_config_for(L)
     if c2.button("Executar comparação", type="primary"):
         ss.is_example = False
-        if execute():
-            go("Dashboard")
-        else:
-            go("Nova Validação")
+        go("Dashboard" if execute() else "Nova Validação")
         st.rerun()
 
 

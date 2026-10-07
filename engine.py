@@ -6,6 +6,7 @@ normaliza valores, classifica cada campo e gera o relatório Excel.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import math
 import re
@@ -238,6 +239,136 @@ def files_from_path(path: str) -> list[tuple[str, bytes]]:
     raise FileNotFoundError(p)
 
 
+# --------------------------------------------------------------------------- vários layouts
+LAYOUT_STOP = {"LAYOUT", "INICIAL", "ORIGEM", "ORIGINAL", "SENIOR", "EXTRACAO", "EXTRAIDO", "EXTRAIDA", "EXPORT", "EXPORTACAO",
+               "AJUSTADO", "AJUSTADA", "AJUSTE", "CORRIGIDO", "CORRIGIDA", "CORRECAO", "POS", "PRE", "MIGRACAO", "CARGA",
+               "FINAL", "EXEMPLO", "DADOS", "ARQUIVO", "BASE", "IMPORTACAO", "IMPORT", "1A", "2A", "3A", "V1", "V2", "V3",
+               "PRIMEIRA", "SEGUNDA", "TERCEIRA", "DE", "DA", "DO", "DOS", "DAS", "E", "CSV", "TXT", "XLSX", "XLS", "PLAN", "PLANILHA",
+               "SHEET", "SHEET1", "PLAN1", "ABA", "COLADO", "CONTEUDO"}
+
+
+def layout_label(fonte: str) -> str:
+    """Nome legível do layout a partir do nome do arquivo/aba (ex.: '1031_dependentes_inicial.xlsx' → '1031 Dependentes')."""
+    parts = [p.strip() for p in fonte.split("›")]
+    cand = parts[-1] if len(parts) > 1 and canon(parts[-1]) not in LAYOUT_STOP else parts[0]
+    cand = re.sub(r"\.(xlsx|xlsm|xls|csv|txt)$", "", cand, flags=re.I)
+    toks = [t for t in re.split(r"[\s_\-.()\[\]]+", strip_accents(cand)) if t]
+    keep = [t for t in toks if canon(t) not in LAYOUT_STOP and not re.fullmatch(r"\d{6,8}", t)]
+    if not keep:
+        return ""
+    return " ".join(t if t.isdigit() or t.isupper() and len(t) <= 4 else t.capitalize() for t in keep)
+
+
+def read_tables(sources: list[tuple[str, object]]) -> list[dict]:
+    """Lê cada arquivo/aba como tabela separada (sem somar)."""
+    out = []
+    for name, data in sources:
+        try:
+            for label, m in read_source(name, data):
+                t = matrix_to_table(m)
+                out.append({"fonte": label, "arquivo": name, **(t or {"headers": [], "rows": [], "header_row": 0})})
+        except Exception as e:
+            out.append({"fonte": name, "arquivo": name, "headers": [], "rows": [], "header_row": 0, "erro": str(e)})
+    return out
+
+
+def group_stage(tables: list[dict]) -> list[dict]:
+    """Agrupa as tabelas de uma etapa por estrutura de colunas; tabelas da mesma estrutura são somadas."""
+    groups: list[dict] = []
+    info = []
+    for t in tables:
+        if t.get("erro"):
+            info.append({"fonte": t["fonte"], "registros": 0, "grupo": None, "situacao": "não foi possível ler: " + t["erro"]})
+            continue
+        if not t["rows"]:
+            info.append({"fonte": t["fonte"], "registros": 0, "grupo": None, "situacao": "sem registros"})
+            continue
+        tc = [canon(h) for h in t["headers"]]
+        target = None
+        for g in groups:
+            gc = [canon(h) for h in g["headers"]]
+            hits = len(set(gc) & set(tc))
+            if hits >= math.ceil(len(gc) * 0.5) and hits >= math.ceil(len(tc) * 0.5):
+                target = g
+                break
+        if target is None:
+            groups.append({"headers": list(t["headers"]), "rows": [list(r) for r in t["rows"]], "fontes": [t["fonte"]],
+                           "arquivos": [t["arquivo"]], "header_row": t["header_row"]})
+            info.append({"fonte": t["fonte"], "registros": len(t["rows"]), "grupo": len(groups) - 1,
+                         "situacao": "cabeçalho detectado" if t["header_row"] else "sem cabeçalho (colunas numeradas)"})
+        else:
+            cmap = [next((j for j, o in enumerate(t["headers"]) if canon(o) == canon(h)), -1) for h in target["headers"]]
+            target["rows"].extend([[r[j] if 0 <= j < len(r) else "" for j in cmap] for r in t["rows"]])
+            target["fontes"].append(t["fonte"])
+            if t["arquivo"] not in target["arquivos"]:
+                target["arquivos"].append(t["arquivo"])
+            info.append({"fonte": t["fonte"], "registros": len(t["rows"]), "grupo": groups.index(target), "situacao": "somada ao mesmo layout"})
+    for i, g in enumerate(groups):
+        g["gid"] = hashlib.md5("|".join(g["fontes"]).encode()).hexdigest()[:10]
+        g["nome"] = next((n for n in (layout_label(f) for f in g["fontes"]) if n), f"Layout {i + 1}")
+    return {"groups": groups, "info": info}
+
+
+def _syn_set(headers) -> set:
+    return {syn_name(h) for h in headers if canon(h)}
+
+
+def _name_tokens(nome: str) -> set:
+    return {canon(t) for t in re.split(r"\s+", nome) if canon(t)}
+
+
+def match_score(a: dict, b: dict) -> float:
+    A, B = _syn_set(a["headers"]), _syn_set(b["headers"])
+    if not A or not B:
+        return 0.0
+    score = len(A & B) / min(len(A), len(B))
+    ta, tb = _name_tokens(a["nome"]), _name_tokens(b["nome"])
+    if ta and tb and ta & tb:
+        score += 0.35
+    return score
+
+
+def assign_layouts(stage_groups: list[list[dict]], overrides: dict | None = None) -> dict:
+    """Cada grupo da origem vira um layout; grupos das demais etapas vão para o layout de maior afinidade.
+    overrides: {gid: lid | '__ignorar'} definido pelo usuário."""
+    overrides = overrides or {}
+    origin = stage_groups[0] if stage_groups else []
+    layouts = [{"lid": g["gid"], "nome": g["nome"], "groups": [g] + [None] * (len(stage_groups) - 1)} for g in origin]
+    by_lid = {L["lid"]: L for L in layouts}
+    unassigned = []
+    for si in range(1, len(stage_groups)):
+        scored = []
+        for g in stage_groups[si]:
+            ov = overrides.get(g["gid"])
+            if ov == "__ignorar":
+                unassigned.append((si, g))
+                continue
+            if ov in by_lid:
+                scored.append((99.0, g, by_lid[ov]))
+                continue
+            best = max(((match_score(L["groups"][0], g), L) for L in layouts), key=lambda x: x[0], default=(0, None))
+            if best[1] is not None and best[0] >= 0.4:
+                scored.append((best[0], g, best[1]))
+            else:
+                unassigned.append((si, g))
+        for sc, g, L in sorted(scored, key=lambda x: -x[0]):
+            if L["groups"][si] is None:
+                L["groups"][si] = g
+            else:
+                unassigned.append((si, g))
+    return {"layouts": layouts, "unassigned": unassigned}
+
+
+def layout_stages(L: dict, stage_defs: list[dict]) -> list[dict]:
+    out = []
+    for g, sd in zip(L["groups"], stage_defs):
+        if g is None:
+            out.append({"headers": [], "rows": [], "nome": sd["nome"], "tipo": sd["tipo"], "arquivos": ""})
+        else:
+            out.append({"headers": g["headers"], "rows": g["rows"], "nome": sd["nome"], "tipo": sd["tipo"], "arquivos": ", ".join(g["fontes"])})
+    return out
+
+
 # --------------------------------------------------------------------------- DE/PARA
 def guess_type(h: str, headers: list, rows: list) -> str:
     c, g = canon(h), syn_name(h)
@@ -270,6 +401,17 @@ def find_match(name: str, headers: list) -> str:
         for h in headers:
             if SYN_IDX.get(canon(h)) == g:
                 return h
+    # nome composto (ex.: CPF_DEPENDENTE): procura o sinônimo mais longo contido no nome
+    best = None  # prioriza o sinônimo no início do nome (CPF_DEPENDENTE → CPF), depois o mais longo
+    for alias, gi in SYN_IDX.items():
+        if len(alias) >= 3 and alias in c:
+            rank = (c.startswith(alias), len(alias))
+            if best is None or rank > best[2]:
+                best = (alias, gi, rank)
+    if best:
+        cands = [h for h in headers if SYN_IDX.get(canon(h)) == best[1]]
+        if len(cands) == 1:
+            return cands[0]
     return ""
 
 
@@ -301,10 +443,54 @@ def auto_map(stages: list[dict], fields: list[dict]) -> list[dict]:
                 cols.append(find_match(h, st["headers"]))
         f["cols"] = cols
         out.append(f)
+    if not any(f.get("papel") == "nome" for f in out):
+        for f in out:
+            if syn_name(f["nome"]) == "NOMDEP":
+                f["papel"] = "nome"
+                break
     return out
 
 
-def guess_key(fields: list[dict]) -> list[str]:
+def _dup_ratio(base: dict | None, fields: list[dict], key: list[str]) -> float:
+    if not base or not base.get("rows") or not key:
+        return 0.0
+    idx = [base["headers"].index(k) for k in key if k in base["headers"]]
+    if not idx:
+        return 1.0
+    seen, dup = set(), 0
+    for r in base["rows"]:
+        t = tuple(canon(r[i]) if i < len(r) else "" for i in idx)
+        if t in seen:
+            dup += 1
+        seen.add(t)
+    return dup / len(base["rows"])
+
+
+def guess_key(fields: list[dict], base: dict | None = None) -> list[str]:
+    """Sugere a chave pelos nomes Senior e completa com colunas até os registros ficarem únicos na origem."""
+    key = _guess_key_names(fields)
+    if not base or not key or _dup_ratio(base, fields, key) <= 0.01:
+        return key
+    prio = ["CODDEP", "INIFER", "DATNAS", "DATADM"]
+    cands = [f["nome"] for f in fields if f["nome"] not in key]
+    cands.sort(key=lambda n: (prio.index(syn_name(n)) if syn_name(n) in prio else len(prio),
+                              0 if re.match(r"^(COD|NUM|SEQ|DAT|DATA|TIP|INI)", canon(n)) else 1))
+    ratio = _dup_ratio(base, fields, key)
+    for _ in range(3):
+        best = min(cands, key=lambda n: _dup_ratio(base, fields, key + [n]), default=None)
+        if best is None:
+            break
+        new = _dup_ratio(base, fields, key + [best])
+        if new > ratio * 0.5:  # a coluna não resolve a repetição (ex.: linha realmente duplicada)
+            break
+        key, ratio = key + [best], new
+        cands.remove(best)
+        if ratio <= 0.01:
+            break
+    return key
+
+
+def _guess_key_names(fields: list[dict]) -> list[str]:
     by = {syn_name(f["nome"]): f["nome"] for f in reversed(fields)}
     e, t, c, cpf = by.get("NUMEMP"), by.get("TIPCOL"), by.get("NUMCAD"), by.get("NUMCPF")
     if e and t and c:
@@ -745,15 +931,15 @@ def build_summary(R) -> str:
 
 
 # --------------------------------------------------------------------------- tabelas e Excel
-def lines_frame(R, lines):
+def lines_frame(R, lines, with_layout=False):
     import pandas as pd
     names = [s["nome"] for s in R["stages"]]
-    cols = ["Chave", "Colaborador", "Matrícula", "CPF", "Empresa", "Campo"] + names + ["Resultado", "Etapa", "Análise"]
+    cols = (["Layout"] if with_layout else []) + ["Chave", "Colaborador", "Matrícula", "CPF", "Empresa", "Campo"] + names + ["Resultado", "Etapa", "Análise"]
     data = []
     nz = R["nz"]
     for l in lines:
         rec = l["rec"]
-        data.append([rec["key"], rec.get("nome", ""), rec.get("matricula", ""), rec.get("cpf", ""), rec.get("empresa", ""),
+        data.append(([R["meta"].get("layout", "")] if with_layout else []) + [rec["key"], rec.get("nome", ""), rec.get("matricula", ""), rec.get("cpf", ""), rec.get("empresa", ""),
                      l["f"]["nome"] if l["f"] else "(registro)", *[show(v, l["f"], nz) for v in l["raws"]],
                      STATUS[l["code"]]["label"], l["etapa"], l["nota"]])
     # nomes de etapa repetidos não podem virar colunas duplicadas
@@ -769,20 +955,70 @@ def lines_frame(R, lines):
     return pd.DataFrame(data, columns=uniq)
 
 
+def overall(results: list[dict]) -> dict:
+    """Indicadores somados de vários layouts."""
+    keys = ["total", "corretos", "divergentes", "nao_migrados", "somente_senior", "chave_nl", "duplicados", "alterados",
+            "corrigidos", "manual", "pendentes", "div_campos", "corr_campos", "alt_campos", "pend_campos"]
+    k = {x: sum(R["k"][x] for R in results) for x in keys}
+    k["aderencia"] = k["corretos"] / k["total"] * 100 if k["total"] else 0.0
+    k["layouts"] = len(results)
+    return k
+
+
+def overview_rows(results: list[dict]) -> list[dict]:
+    return [{"Layout": R["meta"].get("layout", ""), "Chave": " + ".join(R["key"]), "Registros": R["k"]["total"],
+             "Corretos": R["k"]["corretos"], "Com divergência": R["k"]["divergentes"], "Não migrados": R["k"]["nao_migrados"],
+             "Somente Senior": R["k"]["somente_senior"], "Corrigidos": R["k"]["corrigidos"], "Validação manual": R["k"]["manual"],
+             "Divergências de campo": R["k"]["div_campos"], "Aderência (%)": round(R["k"]["aderencia"], 2)} for R in results]
+
+
+def build_summary_multi(results: list[dict]) -> str:
+    if len(results) == 1:
+        return results[0]["summary"]
+    k = overall(results)
+    nomes = [R["meta"].get("layout") or "sem nome" for R in results]
+    p = [f"Foram validados {len(results)} layouts ({_list(nomes)}), com {fmt_int(k['total'])} registros no total e "
+         f"aderência geral de {fmt_pct(k['aderencia'])}."]
+    pior = min(results, key=lambda R: R["k"]["aderencia"])
+    melhor = max(results, key=lambda R: R["k"]["aderencia"])
+    if pior is not melhor:
+        p.append(f"A menor aderência está em {pior['meta'].get('layout')} ({fmt_pct(pior['k']['aderencia'])}) e a maior em "
+                 f"{melhor['meta'].get('layout')} ({fmt_pct(melhor['k']['aderencia'])}).")
+    if k["div_campos"]:
+        p.append(f"Ao todo, foram encontradas {fmt_int(k['div_campos'])} divergências de campo: {fmt_int(k['corr_campos'])} corrigidas no "
+                 f"Layout Ajustado e {fmt_int(k['pend_campos'])} pendentes de validação.")
+    if k["nao_migrados"]:
+        p.append(f"{fmt_int(k['nao_migrados'])} " + ("registros não foram migrados." if k["nao_migrados"] > 1 else "registro não foi migrado."))
+    return " ".join(p)
+
+
 def export_excel(R, stages: list[dict]) -> bytes:
+    return export_excel_multi([(R, stages)])
+
+
+def export_excel_multi(items: list[tuple[dict, list[dict]]]) -> bytes:
+    """items: [(resultado, etapas do layout)] — um único Excel para todos os layouts."""
+    import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
+    results = [R for R, _ in items]
+    multi = len(results) > 1
     wb = Workbook()
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="12804A")
+    band_fill = PatternFill("solid", fgColor="E2F2E9")
+
+    def style_head(ws, row):
+        for c in ws[row]:
+            if c.value is not None:
+                c.font, c.fill = head_font, head_fill
 
     def sheet(title, df, widths=None):
         ws = wb.create_sheet(title)
         ws.append(list(df.columns))
-        for c in ws[1]:
-            c.font, c.fill = head_font, head_fill
+        style_head(ws, 1)
         res_col = list(df.columns).index("Resultado") + 1 if "Resultado" in df.columns else None
         for row in df.itertuples(index=False):
             ws.append([("" if v is None else v) for v in row])
@@ -798,55 +1034,109 @@ def export_excel(R, stages: list[dict]) -> bytes:
             ws.column_dimensions[get_column_letter(i)].width = w
         return ws
 
-    import pandas as pd
-    k, m = R["k"], R["meta"]
+    m = results[0]["meta"]
     ws = wb.active
     ws.title = "RESUMO"
-    rows = [["Validador Pós-Migração — Agante Tecnologia | Senior HCM"], [],
-            ["Cliente", m.get("cliente", "")], ["Projeto", m.get("projeto", "")], ["Módulo", m.get("modulo", "")],
-            ["Layout", m.get("layout", "")], ["Data da validação", br_date(m.get("data", ""))], ["Responsável", m.get("responsavel", "")],
-            ["Processado em", R["at"].strftime("%d/%m/%Y %H:%M")], ["Chave de comparação", " + ".join(R["key"])], [],
-            ["Etapa", "Tipo", "Arquivo(s)", "Registros"],
-            *[[s["nome"], TIPO_ETAPA[s["tipo"]], s["arquivos"] or "(não carregado)", s["n"]] for s in R["stages"]], [],
-            ["Indicador", "Valor"],
-            ["Total de registros analisados", k["total"]], ["Registros corretos", k["corretos"]],
-            ["Registros com divergência", k["divergentes"]], ["Registros não migrados", k["nao_migrados"]],
-            ["Registros criados somente no Senior", k["somente_senior"]], ["Registros alterados", k["alterados"]],
-            ["Registros corrigidos", k["corrigidos"]], ["Registros que necessitam validação manual", k["manual"]],
-            ["Divergências de campo", k["div_campos"]], ["Aderência da migração (%)", round(k["aderencia"], 2)], [],
-            ["Campo", "Registros", "Divergências", "% Correto"],
-            *[[x["campo"], x["registros"], x["divergencias"], round(x["pct"], 2)] for x in R["field_stats"]], [],
-            ["Resumo da validação"], [R["summary"]]]
-    for r in rows:
-        ws.append(r)
+    ws.append(["Validador Pós-Migração — Agante Tecnologia | Senior HCM"])
     ws["A1"].font = Font(bold=True, size=14, color="12804A")
-    for r in ws.iter_rows():
-        if r[0].value in ("Etapa", "Indicador", "Campo", "Resumo da validação"):
-            for c in r:
-                if c.value is not None:
-                    c.font = Font(bold=True)
+    ws.append([])
+    for lbl, v in [("Cliente", m.get("cliente", "")), ("Projeto", m.get("projeto", "")), ("Módulo", m.get("modulo", "")),
+                   ("Layouts", ", ".join(R["meta"].get("layout", "") for R in results)), ("Data da validação", br_date(m.get("data", ""))),
+                   ("Responsável", m.get("responsavel", "")), ("Processado em", results[0]["at"].strftime("%d/%m/%Y %H:%M"))]:
+        ws.append([lbl, v])
+    if multi:
+        k = overall(results)
+        ws.append([])
+        ws.append(["Visão geral"])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
+        ov = overview_rows(results)
+        ws.append(list(ov[0].keys()))
+        style_head(ws, ws.max_row)
+        for r in ov:
+            ws.append(list(r.values()))
+        ws.append(["TOTAL", "", k["total"], k["corretos"], k["divergentes"], k["nao_migrados"], k["somente_senior"], k["corrigidos"],
+                   k["manual"], k["div_campos"], round(k["aderencia"], 2)])
+        for c in ws[ws.max_row]:
+            c.font = Font(bold=True)
+        ws.append([])
+        ws.append(["Resumo geral"])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+        ws.append([build_summary_multi(results)])
+        ws.cell(row=ws.max_row, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=8)
+        ws.row_dimensions[ws.max_row].height = 75
+    for R in results:
+        k = R["k"]
+        ws.append([])
+        ws.append([f"Layout: {R['meta'].get('layout') or 'sem nome'}"])
+        for c in ws[ws.max_row]:
+            c.font, c.fill = Font(bold=True, size=12, color="12804A"), band_fill
+        rows = [["Chave de comparação", " + ".join(R["key"])], [],
+                ["Etapa", "Tipo", "Arquivo(s)", "Registros"],
+                *[[s["nome"], TIPO_ETAPA[s["tipo"]], s["arquivos"] or "(não carregado)", s["n"]] for s in R["stages"]], [],
+                ["Indicador", "Valor"],
+                ["Total de registros analisados", k["total"]], ["Registros corretos", k["corretos"]],
+                ["Registros com divergência", k["divergentes"]], ["Registros não migrados", k["nao_migrados"]],
+                ["Registros criados somente no Senior", k["somente_senior"]], ["Registros alterados", k["alterados"]],
+                ["Registros corrigidos", k["corrigidos"]], ["Registros que necessitam validação manual", k["manual"]],
+                ["Divergências de campo", k["div_campos"]], ["Aderência da migração (%)", round(k["aderencia"], 2)], [],
+                ["Campo", "Registros", "Divergências", "% Correto"],
+                *[[x["campo"], x["registros"], x["divergencias"], round(x["pct"], 2)] for x in R["field_stats"]], [],
+                ["Resumo da validação"], [R["summary"]]]
+        for r in rows:
+            ws.append(r)
+            if r and r[0] in ("Etapa", "Indicador", "Campo", "Resumo da validação"):
+                for c in ws[ws.max_row]:
+                    if c.value is not None:
+                        c.font = Font(bold=True)
+        ws.cell(row=ws.max_row, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=8)
+        ws.row_dimensions[ws.max_row].height = 95
     ws.column_dimensions["A"].width = 42
-    for col in "BCD":
-        ws.column_dimensions[col].width = 30
-    ws.cell(row=ws.max_row, column=1).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=4)
-    ws.row_dimensions[ws.max_row].height = 110
+    for col in "BCDEFGHIJK":
+        ws.column_dimensions[col].width = 18 if multi else 30
 
-    L = R["lines"]
     w = {"Análise": 60, "Resultado": 30}
-    sheet("COMPARATIVO COMPLETO", lines_frame(R, L), w)
-    sheet("DIVERGÊNCIAS", lines_frame(R, [l for l in L if l["code"] != "OK"]), w)
 
-    def rec_frame(code, si):
-        st = stages[si]
-        data = [[r["key"], *st["rows"][r["rows"][si]]] for r in R["records"] if r["status"] == code and r["present"][si]]
-        return pd.DataFrame(data, columns=["Chave", *st["headers"]]).map(lambda v: show(v) if v is not None else "")
+    def lines_all(pred):
+        frames = [lines_frame(R, [l for l in R["lines"] if pred(l)], with_layout=multi) for R in results]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    sheet("NÃO MIGRADOS", rec_frame("NAO_MIGRADO", 0))
-    sen = next((i for i, s in enumerate(stages) if s["tipo"] == "senior" and s["rows"]), None)
-    sheet("SOMENTE SENIOR", rec_frame("SOMENTE_SENIOR", sen) if sen is not None else pd.DataFrame(columns=["Chave"]))
-    sheet("CORRIGIDOS", lines_frame(R, [l for l in L if l["code"] == "CORRIGIDO"]), w)
-    sheet("VALIDAÇÃO MANUAL", lines_frame(R, [l for l in L if l["code"] in ("MANUAL", "DUPLICADO", "CHAVE_NL")]), w)
+    sheet("COMPARATIVO COMPLETO", lines_all(lambda l: True), w)
+    sheet("DIVERGÊNCIAS", lines_all(lambda l: l["code"] != "OK"), w)
+
+    def rec_sheet(title, code, pick_stage):
+        ws2 = wb.create_sheet(title)
+        first = True
+        for R, stages in items:
+            si = pick_stage(stages)
+            recs = [r for r in R["records"] if si is not None and r["status"] == code and r["present"][si]]
+            if not recs and multi:
+                continue
+            if multi:
+                if not first:
+                    ws2.append([])
+                ws2.append([f"Layout: {R['meta'].get('layout')}"])
+                for c in ws2[ws2.max_row]:
+                    c.font, c.fill = Font(bold=True, color="12804A"), band_fill
+            first = False
+            st_ = stages[si] if si is not None else {"headers": []}
+            ws2.append(["Chave", *st_["headers"]])
+            style_head(ws2, ws2.max_row)
+            for r in recs:
+                ws2.append([r["key"], *[show(v) if v is not None else "" for v in st_["rows"][r["rows"][si]]]])
+        if first:
+            ws2.append(["Nenhum registro."])
+        ws2.column_dimensions["A"].width = 24
+        for i in range(2, 40):
+            ws2.column_dimensions[get_column_letter(i)].width = 16
+        return ws2
+
+    rec_sheet("NÃO MIGRADOS", "NAO_MIGRADO", lambda st_: 0)
+    rec_sheet("SOMENTE SENIOR", "SOMENTE_SENIOR",
+              lambda st_: next((i for i, x in enumerate(st_) if x["tipo"] == "senior" and x["rows"]), None))
+    sheet("CORRIGIDOS", lines_all(lambda l: l["code"] == "CORRIGIDO"), w)
+    sheet("VALIDAÇÃO MANUAL", lines_all(lambda l: l["code"] in ("MANUAL", "DUPLICADO", "CHAVE_NL")), w)
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -907,3 +1197,39 @@ def make_example():
     r21[6] = "1003"
     aj.append(r21)
     return [("exemplo_layout_inicial.xlsx", ini), ("exemplo_extracao_senior.csv", sen), ("exemplo_layout_ajustado.xlsx", aj)]
+
+
+
+def make_example_multi():
+    """Exemplo com dois layouts no mesmo lote: Colaboradores e 1031 Dependentes."""
+    import random
+    col = make_example()
+    ini_c, sen_c, aj_c = col[0][1], col[1][1], col[2][1]
+    rnd = random.Random(11)
+    nomes = ["Lucas", "Sofia", "Miguel", "Helena", "Arthur", "Laura", "Davi", "Alice", "Gael", "Valentina", "Theo", "Cecília",
+             "Heitor", "Maria Clara", "Bernardo", "Isadora", "Samuel", "Lorena", "Pedro", "Manuela", "Gabriel", "Luiza", "Rafael", "Beatriz"]
+    deps = []
+    for i, r in enumerate(ini_c[1:41:2]):
+        sobrenome = r[3].split()[-1]
+        for j in range(1 + (i % 3 == 0)):
+            nm = f"{nomes[(i * 2 + j) % len(nomes)]} {sobrenome}"
+            deps.append({"emp": r[0], "tip": r[1], "cad": r[2], "dep": str(j + 1), "nome": nm,
+                         "par": rnd.choice(["1", "1", "4", "2"]), "nas": f"{rnd.randint(1, 28):02d}/{rnd.randint(1, 12):02d}/{rnd.randint(2008, 2022)}",
+                         "cpf": "".join(str(rnd.randint(0, 9)) for _ in range(11))})
+    h0 = ["COD_EMPRESA", "TIPO_COLABORADOR", "MATRICULA", "COD_DEPENDENTE", "NOME_DEPENDENTE", "GRAU_PARENTESCO", "DATA_NASCIMENTO", "CPF_DEPENDENTE"]
+    h1 = ["NumEmp", "TipCol", "NumCad", "CodDep", "NomDep", "GraPar", "DatNas", "NumCpf"]
+    ini_d = [h0] + [[d["emp"], d["tip"], d["cad"], d["dep"], d["nome"], d["par"], d["nas"], d["cpf"]] for d in deps]
+    sen_d = [h1]
+    for i, d in enumerate(deps):
+        if i in (4, 17):
+            continue
+        par = "3" if i == 7 else d["par"]
+        dd, mm, yy = d["nas"].split("/")
+        nas = f"{yy}-{mm}-{'01' if i == 11 else dd}"
+        sen_d.append([d["emp"], d["tip"], d["cad"], d["dep"], strip_accents(d["nome"]).upper(), par, nas, "" if i == 14 else d["cpf"]])
+    aj_d = [h0, [deps[7]["emp"], deps[7]["tip"], deps[7]["cad"], deps[7]["dep"], deps[7]["nome"], deps[7]["par"], deps[7]["nas"], deps[7]["cpf"]]]
+    return {
+        "origem": [("colaboradores_layout_inicial.xlsx", ini_c), ("1031_dependentes_layout_inicial.xlsx", ini_d)],
+        "senior": [("colaboradores_extracao_senior.csv", sen_c), ("1031_dependentes_extracao_senior.csv", sen_d)],
+        "ajuste": [("colaboradores_layout_ajustado.xlsx", aj_c), ("1031_dependentes_layout_ajustado.xlsx", aj_d)],
+    }

@@ -42,6 +42,19 @@ Em todos os modos, a leitura é automática:
 - Todas as abas de uma planilha são lidas.
 - Vários arquivos na mesma etapa são somados.
 
+## Vários layouts no mesmo lote
+
+1. Em cada etapa, carregue os arquivos de **todos os layouts** do lote. Exemplo: no *Layout Inicial*, os arquivos de Colaboradores, 1031 Dependentes e 1035 Férias; no *Senior*, as extrações correspondentes (ex.: R034FUN, R036DEP).
+2. O validador separa os arquivos sozinho:
+   - Arquivos com as **mesmas colunas** são somados no mesmo layout.
+   - Estruturas diferentes viram **layouts diferentes**.
+   - Cada arquivo do Senior e do Ajustado é associado ao layout de origem com mais colunas em comum, considerando os nomes Senior (`MATRICULA` → `NumCad`). O nome do arquivo também conta.
+3. Em **Layouts identificados**, confira o pareamento, renomeie os layouts e corrija associações, se necessário.
+4. Ajuste **chave e DE/PARA de cada layout**. A chave é sugerida de forma a não repetir registros; para dependentes, por exemplo, entra o código do dependente.
+5. Execute: o Dashboard mostra a aderência geral e por layout, e o Excel sai com todos os layouts, identificados na coluna *Layout*.
+
+Layouts sem extração do Senior são listados como *não processados*, sem impedir os demais. Configurações salvas com o mesmo nome de um layout são aplicadas automaticamente.
+
 ## Logos
 
 Coloque os arquivos `assets/logo_agante.png` e `assets/logo_senior.png`. Sem eles, o cabeçalho mostra os nomes em texto.
