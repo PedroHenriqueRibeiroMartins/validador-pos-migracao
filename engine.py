@@ -965,6 +965,29 @@ def overall(results: list[dict]) -> dict:
     return k
 
 
+def top_fields(R, n=3) -> list[str]:
+    return [x["campo"] for x in sorted([x for x in R["field_stats"] if x["divergencias"]], key=lambda x: -x["divergencias"])[:n]]
+
+
+def layout_status(R) -> str:
+    k = R["k"]
+    if not k["div_campos"] and not k["nao_migrados"] and not k["somente_senior"] and not k["manual"]:
+        return "Sem divergências"
+    if k["pend_campos"] or k["nao_migrados"] or k["manual"]:
+        return "Com pendências"
+    return "Divergências corrigidas"
+
+
+def divergence_rows(results: list[dict]) -> list[dict]:
+    """Uma linha por layout com o que precisa de atenção."""
+    return [{"Layout": R["meta"].get("layout", ""), "Situação": layout_status(R),
+             "Divergências de campo": R["k"]["div_campos"], "Pendentes": R["k"]["pend_campos"],
+             "Corrigidas": R["k"]["corr_campos"], "Não migrados": R["k"]["nao_migrados"],
+             "Somente Senior": R["k"]["somente_senior"], "Validação manual": R["k"]["manual"],
+             "Campos mais afetados": ", ".join(top_fields(R)) or "—",
+             "Aderência (%)": round(R["k"]["aderencia"], 2)} for R in results]
+
+
 def overview_rows(results: list[dict]) -> list[dict]:
     return [{"Layout": R["meta"].get("layout", ""), "Chave": " + ".join(R["key"]), "Registros": R["k"]["total"],
              "Corretos": R["k"]["corretos"], "Com divergência": R["k"]["divergentes"], "Não migrados": R["k"]["nao_migrados"],
@@ -989,6 +1012,22 @@ def build_summary_multi(results: list[dict]) -> str:
                  f"Layout Ajustado e {fmt_int(k['pend_campos'])} pendentes de validação.")
     if k["nao_migrados"]:
         p.append(f"{fmt_int(k['nao_migrados'])} " + ("registros não foram migrados." if k["nao_migrados"] > 1 else "registro não foi migrado."))
+    partes = []
+    for R in results:
+        kk = R["k"]
+        if not (kk["div_campos"] or kk["nao_migrados"] or kk["somente_senior"]):
+            partes.append(f"{R['meta'].get('layout')}: sem divergências")
+            continue
+        itens = []
+        if kk["div_campos"]:
+            tf = top_fields(R)
+            itens.append(f"{fmt_int(kk['div_campos'])} divergências de campo" + (f" ({', '.join(tf)})" if tf else ""))
+        if kk["nao_migrados"]:
+            itens.append(f"{fmt_int(kk['nao_migrados'])} não migrado(s)")
+        if kk["somente_senior"]:
+            itens.append(f"{fmt_int(kk['somente_senior'])} somente no Senior")
+        partes.append(f"{R['meta'].get('layout')}: " + ", ".join(itens))
+    p.append("Por layout — " + "; ".join(partes) + ".")
     return " ".join(p)
 
 
@@ -1044,6 +1083,18 @@ def export_excel_multi(items: list[tuple[dict, list[dict]]]) -> bytes:
                    ("Layouts", ", ".join(R["meta"].get("layout", "") for R in results)), ("Data da validação", br_date(m.get("data", ""))),
                    ("Responsável", m.get("responsavel", "")), ("Processado em", results[0]["at"].strftime("%d/%m/%Y %H:%M"))]:
         ws.append([lbl, v])
+    ws.append([])
+    ws.append(["Divergências por layout"])
+    ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
+    dr = divergence_rows(results)
+    ws.append(list(dr[0].keys()))
+    style_head(ws, ws.max_row)
+    for r in dr:
+        ws.append(list(r.values()))
+        sit = ws.cell(row=ws.max_row, column=2)
+        tone = {"Sem divergências": "ok", "Divergências corrigidas": "fix"}.get(sit.value, "bad")
+        sit.fill = PatternFill("solid", fgColor=TONE_BG[tone][1:])
+        sit.font = Font(bold=True, color=TONE_FG[tone][1:])
     if multi:
         k = overall(results)
         ws.append([])
@@ -1099,7 +1150,7 @@ def export_excel_multi(items: list[tuple[dict, list[dict]]]) -> bytes:
     w = {"Análise": 60, "Resultado": 30}
 
     def lines_all(pred):
-        frames = [lines_frame(R, [l for l in R["lines"] if pred(l)], with_layout=multi) for R in results]
+        frames = [lines_frame(R, [l for l in R["lines"] if pred(l)], with_layout=True) for R in results]
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     sheet("COMPARATIVO COMPLETO", lines_all(lambda l: True), w)
@@ -1111,24 +1162,24 @@ def export_excel_multi(items: list[tuple[dict, list[dict]]]) -> bytes:
         for R, stages in items:
             si = pick_stage(stages)
             recs = [r for r in R["records"] if si is not None and r["status"] == code and r["present"][si]]
-            if not recs and multi:
+            if not recs:
                 continue
-            if multi:
-                if not first:
-                    ws2.append([])
-                ws2.append([f"Layout: {R['meta'].get('layout')}"])
-                for c in ws2[ws2.max_row]:
-                    c.font, c.fill = Font(bold=True, color="12804A"), band_fill
+            if not first:
+                ws2.append([])
+            ws2.append([f"Layout: {R['meta'].get('layout')}"])
+            for c in ws2[ws2.max_row]:
+                c.font, c.fill = Font(bold=True, color="12804A"), band_fill
             first = False
-            st_ = stages[si] if si is not None else {"headers": []}
-            ws2.append(["Chave", *st_["headers"]])
+            st_ = stages[si]
+            ws2.append(["Layout", "Chave", *st_["headers"]])
             style_head(ws2, ws2.max_row)
             for r in recs:
-                ws2.append([r["key"], *[show(v) if v is not None else "" for v in st_["rows"][r["rows"][si]]]])
+                ws2.append([R["meta"].get("layout", ""), r["key"], *[show(v) if v is not None else "" for v in st_["rows"][r["rows"][si]]]])
         if first:
             ws2.append(["Nenhum registro."])
-        ws2.column_dimensions["A"].width = 24
-        for i in range(2, 40):
+        ws2.column_dimensions["A"].width = 20
+        ws2.column_dimensions["B"].width = 24
+        for i in range(3, 40):
             ws2.column_dimensions[get_column_letter(i)].width = 16
         return ws2
 

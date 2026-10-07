@@ -426,7 +426,46 @@ def result_picker(key: str, allow_all=True) -> list:
     opts = {"Todos os layouts": ss.results} if allow_all else {}
     for R in ss.results:
         opts[R["meta"].get("layout") or "sem nome"] = [R]
+    alvo = ss.pop("goto_layout", None)
+    if alvo in opts:
+        ss[key] = alvo
     return opts[st.selectbox("Layout", list(opts), key=key)]
+
+
+SIT_TONE = {"Sem divergências": "ok", "Divergências corrigidas": "fix", "Com pendências": "bad"}
+
+
+def divergence_panel(key: str):
+    """Painel: em qual layout estão as divergências, com atalho para a análise."""
+    rows = E.divergence_rows(ss.results)
+    com = [r for r in rows if r["Situação"] != "Sem divergências"]
+    titulo = ("Nenhum layout com divergências" if not com else
+              f"Divergências encontradas em {len(com)} de {len(rows)} layout(s)" if len(rows) > 1 else "Divergências deste layout")
+    with st.container(border=True):
+        st.markdown(f"**{titulo}**")
+        for r in rows:
+            tone = SIT_TONE[r["Situação"]]
+            c1, c2, c3 = st.columns([2.2, 5, 1.4])
+            c1.markdown(f"**{r['Layout']}**<br><span class='vpm-pill' style='background:{E.TONE_BG[tone]};color:{E.TONE_FG[tone]}'>"
+                        f"{r['Situação'].upper()}</span>", unsafe_allow_html=True)
+            if r["Situação"] == "Sem divergências":
+                c2.markdown(f"<span style='color:#73817a'>Todos os registros aderentes · aderência {E.fmt_pct(r['Aderência (%)'])}</span>",
+                            unsafe_allow_html=True)
+                continue
+            det = [f"**{E.fmt_int(r['Divergências de campo'])}** divergências de campo "
+                   f"({E.fmt_int(r['Pendentes'])} pendentes, {E.fmt_int(r['Corrigidas'])} corrigidas)"]
+            if r["Não migrados"]:
+                det.append(f"**{E.fmt_int(r['Não migrados'])}** não migrado(s)")
+            if r["Somente Senior"]:
+                det.append(f"**{E.fmt_int(r['Somente Senior'])}** somente no Senior")
+            if r["Validação manual"]:
+                det.append(f"**{E.fmt_int(r['Validação manual'])}** para validação manual")
+            c2.markdown(" · ".join(det) + (f"  \nCampos mais afetados: {r['Campos mais afetados']}" if r["Campos mais afetados"] != "—" else "")
+                        + f"  \nAderência {E.fmt_pct(r['Aderência (%)'])}")
+            if c3.button("Ver divergências", key=f"{key}_{r['Layout']}", width="stretch"):
+                ss.goto_layout = r["Layout"]
+                go("Divergências")
+                st.rerun()
 
 
 def errors_banner():
@@ -463,9 +502,7 @@ def page_inicio():
             with b:
                 st.markdown('<div class="vpm-eyebrow">Resumo da validação</div>', unsafe_allow_html=True)
                 st.write(ss.summary)
-        if len(ss.results) > 1:
-            st.dataframe(pd.DataFrame(E.overview_rows(ss.results)), hide_index=True, width="stretch",
-                         column_config={"Aderência (%)": st.column_config.ProgressColumn(format="%.2f%%", min_value=0, max_value=100)})
+        divergence_panel("ini_div")
         c = st.columns(4)
         c[0].metric("Com divergência", E.fmt_int(k["divergentes"]))
         c[1].metric("Corrigidos", E.fmt_int(k["corrigidos"]))
@@ -728,7 +765,7 @@ def frames_for(sel, flt):
     frames, recs = [], []
     for R in sel:
         lines = lines_filtered(R, flt)
-        frames.append(E.lines_frame(R, lines, with_layout=multi))
+        frames.append(E.lines_frame(R, lines, with_layout=True))
         recs += [f"{ss.results.index(R)}|{k}" for k in dict.fromkeys(l["rec"]["key"] for l in lines)]
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return df, recs
@@ -774,7 +811,8 @@ def page_divergencias():
     st.markdown('<div class="vpm-eyebrow">Divergências</div>', unsafe_allow_html=True)
     st.subheader("Análise de Divergências")
     m = ss.results[0]["meta"]
-    st.caption(f"Cliente: **{m.get('cliente') or '—'}** · {len(ss.results)} layout(s) · "
+    st.caption("Cada linha indica o **layout** onde a divergência ocorreu, o campo, os valores por etapa e a situação. "
+               f"Cliente: **{m.get('cliente') or '—'}** · {len(ss.results)} layout(s) · "
                f"processado em {ss.results[0]['at'].strftime('%d/%m/%Y %H:%M')}")
     sel = result_picker("lay_div")
     div = [l for R in sel for l in R["lines"] if l["code"] != "OK"]
@@ -852,6 +890,7 @@ def page_dashboard():
                f"processado em {ss.results[0]['at'].strftime('%d/%m/%Y %H:%M')}")
     errors_banner()
     if len(ss.results) == 1:
+        divergence_panel("dash_div1")
         return dashboard_detail(ss.results[0])
     k = E.overall(ss.results)
     with st.container(border=True):
@@ -867,6 +906,7 @@ def page_dashboard():
     for col, (lbl, v) in zip(cols, [("Layouts", k["layouts"]), ("Registros", k["total"]), ("Com divergência", k["divergentes"]),
                                     ("Não migrados", k["nao_migrados"]), ("Validação manual", k["manual"])]):
         col.metric(lbl, E.fmt_int(v))
+    divergence_panel("dash_div")
     st.markdown("**Aderência por layout**")
     st.dataframe(pd.DataFrame(E.overview_rows(ss.results)).sort_values("Aderência (%)"), hide_index=True, width="stretch",
                  column_config={"Aderência (%)": st.column_config.ProgressColumn(format="%.2f%%", min_value=0, max_value=100)})
