@@ -256,7 +256,11 @@ def layout_label(fonte: str) -> str:
     keep = [t for t in toks if canon(t) not in LAYOUT_STOP and not re.fullmatch(r"\d{6,8}", t)]
     if not keep:
         return ""
-    return " ".join(t if t.isdigit() or t.isupper() and len(t) <= 4 else t.capitalize() for t in keep)
+    num = next((t for t in keep if re.fullmatch(r"\d{3,5}", t)), None)
+    rest = [t if t.isdigit() or t.isupper() and len(t) <= 4 else t.capitalize() for t in keep if t != num]
+    if num:
+        return num + (" – " + " ".join(rest) if rest else "")
+    return " ".join(rest)
 
 
 def read_tables(sources: list[tuple[str, object]]) -> list[dict]:
